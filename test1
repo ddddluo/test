@@ -1,0 +1,613 @@
+package com.btechviral.objectdetector;
+
+import android.Manifest;
+import android.annotation.SuppressLint;
+import android.app.Activity;
+import android.app.AlertDialog;
+import android.app.Dialog;
+import android.app.DialogFragment;
+import android.app.Fragment;
+import android.content.Context;
+import android.content.DialogInterface;
+import android.content.pm.PackageManager;
+import android.content.res.Configuration;
+import android.graphics.ImageFormat;
+import android.graphics.Matrix;
+import android.graphics.RectF;
+import android.graphics.SurfaceTexture;
+import android.hardware.camera2.CameraAccessException;
+import android.hardware.camera2.CameraCaptureSession;
+import android.hardware.camera2.CameraCharacteristics;
+import android.hardware.camera2.CameraDevice;
+import android.hardware.camera2.CameraManager;
+import android.hardware.camera2.CaptureRequest;
+import android.hardware.camera2.CaptureResult;
+import android.hardware.camera2.TotalCaptureResult;
+import android.hardware.camera2.params.StreamConfigurationMap;
+import android.media.ImageReader;
+import android.os.Bundle;
+import android.os.Handler;
+import android.os.HandlerThread;
+import android.text.TextUtils;
+import android.util.Log;
+import android.util.Size;
+import android.util.SparseIntArray;
+import android.view.LayoutInflater;
+import android.view.Surface;
+import android.view.TextureView;
+import android.view.View;
+import android.view.ViewGroup;
+import android.widget.Toast;
+
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.Comparator;
+import java.util.List;
+import java.util.concurrent.Semaphore;
+import java.util.concurrent.TimeUnit;
+
+import static androidx.core.content.ContextCompat.checkSelfPermission;
+
+@SuppressLint("ValidFragment")
+public class CameraConnectionFragment extends Fragment {
+
+    /**
+     * 相机预览大小将被选择为最小的帧像素大小的能力
+     * 包含一个DESIRED_SIZE x DESIRED_SIZE正方形。
+     */
+    private static final int MINIMUM_PREVIEW_SIZE = 320;
+
+    /**
+     * 从屏幕旋转到JPEG方向的转换.
+     */
+    private static final SparseIntArray ORIENTATIONS = new SparseIntArray();
+
+    private static final String FRAGMENT_DIALOG = "dialog";
+
+    static {
+        ORIENTATIONS.append(Surface.ROTATION_0, 90);
+        ORIENTATIONS.append(Surface.ROTATION_90, 0);
+        ORIENTATIONS.append(Surface.ROTATION_180, 270);
+        ORIENTATIONS.append(Surface.ROTATION_270, 180);
+    }
+
+    /**
+     * A {@link Semaphore} 在关闭相机之前防止应用程序退出。
+     */
+    private final Semaphore cameraOpenCloseLock = new Semaphore(1);
+    /**
+     * A {@link ImageReader.OnImageAvailableListener} 接收可用的帧。
+     */
+    private final ImageReader.OnImageAvailableListener imageListener;
+    /**
+     * TensorFlow所需的输入大小(以像素为单位)(正方形位图的宽度和高度)。
+     */
+    private final android.util.Size inputSize;
+    /**
+     * 为这个片段膨胀的布局标识符
+     */
+    private final int layout;
+
+    private final ConnectionCallback cameraConnectionCallback;
+    private final CameraCaptureSession.CaptureCallback captureCallback =
+            new CameraCaptureSession.CaptureCallback() {
+                @Override
+                public void onCaptureProgressed(
+                        final CameraCaptureSession session,
+                        final CaptureRequest request,
+                        final CaptureResult partialResult) {
+                }
+
+                @Override
+                public void onCaptureCompleted(
+                        final CameraCaptureSession session,
+                        final CaptureRequest request,
+                        final TotalCaptureResult result) {
+                }
+            };
+    /**
+     * 当前ID {@link CameraDevice}.
+     */
+    private String cameraId;
+    /**
+     * {@link AutoFitTextureView} 相机预览.
+     */
+    private AutoFitTextureView textureView;
+    /**
+     * {@link CameraCaptureSession } 对于相机预览
+     */
+    private CameraCaptureSession captureSession;
+    /**
+     * 对已打开的事物的引用{@link CameraDevice}.
+     */
+    private CameraDevice cameraDevice;
+    /**
+     * 相机传感器从显示器旋转的角度。
+     */
+    private Integer sensorOrientation;
+    /**
+     * 这个 {@link android.util.Size} 关于相机预览
+     */
+    private android.util.Size previewSize;
+    /**
+     * 一个额外的线程，用于运行不应该阻塞UI的任务。
+     */
+    private HandlerThread backgroundThread;
+    /**
+     * {@link Handler} 用于在后台运行任务。
+     */
+    private Handler backgroundHandler;
+    /**
+     * {@link ImageReader} 处理预览帧捕获
+     */
+    private ImageReader previewReader;
+    /**
+     * {@link CaptureRequest.Builder} 对于相机预览
+     */
+    private CaptureRequest.Builder previewRequestBuilder;
+    /**
+     * {@link CaptureRequest} 通过 {@link #previewRequestBuilder} 制作
+     */
+    private CaptureRequest previewRequest;
+    /**
+     * {@link CameraDevice.StateCallback} 被调用 {@link CameraDevice} 改变状态
+     */
+    private final CameraDevice.StateCallback stateCallback =
+            new CameraDevice.StateCallback() {
+                @Override
+                public void onOpened(final CameraDevice cd) {
+                    // This method is called when the camera is opened.  We start camera preview here.
+                    cameraOpenCloseLock.release();
+                    cameraDevice = cd;
+                    createCameraPreviewSession();
+                }
+
+                @Override
+                public void onDisconnected(final CameraDevice cd) {
+                    cameraOpenCloseLock.release();
+                    cd.close();
+                    cameraDevice = null;
+                }
+
+                @Override
+                public void onError(final CameraDevice cd, final int error) {
+                    cameraOpenCloseLock.release();
+                    cd.close();
+                    cameraDevice = null;
+                    final Activity activity = getActivity();
+                    if (null != activity) {
+                        activity.finish();
+                    }
+                }
+            };
+    /**
+     * {@link TextureView.SurfaceTextureListener} 处理{@link TextureView}上的几个生命周期事件
+     */
+    private final TextureView.SurfaceTextureListener surfaceTextureListener =
+            new TextureView.SurfaceTextureListener() {
+                @Override
+                public void onSurfaceTextureAvailable(
+                        final SurfaceTexture texture, final int width, final int height) {
+                    openCamera(width, height);
+                }
+
+                @Override
+                public void onSurfaceTextureSizeChanged(
+                        final SurfaceTexture texture, final int width, final int height) {
+                    configureTransform(width, height);
+                }
+
+                @Override
+                public boolean onSurfaceTextureDestroyed(final SurfaceTexture texture) {
+                    return true;
+                }
+
+                @Override
+                public void onSurfaceTextureUpdated(final SurfaceTexture texture) {
+                }
+            };
+
+    @SuppressLint("ValidFragment")
+    private CameraConnectionFragment(
+            final ConnectionCallback connectionCallback,
+            final ImageReader.OnImageAvailableListener imageListener,
+            final int layout,
+            final android.util.Size inputSize) {
+        this.cameraConnectionCallback = connectionCallback;
+        this.imageListener = imageListener;
+        this.layout = layout;
+        this.inputSize = inputSize;
+    }
+
+    /**
+     * 给定相机支持的{@code Size}的{@code choices}，选择最小的一个
+     * 宽度和高度至少与两者的最小值一样大，或者如果可能的话完全匹配。
+     *
+     * @param choices 相机支持的预期输出类的大小列表
+     * @param width   最小期望宽度
+     * @param height  最小期望高度
+     * @return 最优的{@code Size}，如果没有足够大的，可以任意选择
+     */
+    protected static android.util.Size chooseOptimalSize(final android.util.Size[] choices, final int width, final int height) {
+        final int minSize = Math.max(Math.min(width, height), MINIMUM_PREVIEW_SIZE);
+        final android.util.Size desiredSize = new android.util.Size(width, height);
+
+        // Collect the supported resolutions that are at least as big as the preview Surface
+        boolean exactSizeFound = false;
+        final List<android.util.Size> bigEnough = new ArrayList<android.util.Size>();
+        final List<android.util.Size> tooSmall = new ArrayList<android.util.Size>();
+        for (final android.util.Size option : choices) {
+            if (option.equals(desiredSize)) {
+                // 设置大小但不返回，这样剩余的大小仍将被记录。
+                exactSizeFound = true;
+            }
+
+            if (option.getHeight() >= minSize && option.getWidth() >= minSize) {
+                bigEnough.add(option);
+            } else {
+                tooSmall.add(option);
+            }
+        }
+
+        Log.i("Desired size: ", desiredSize + ", min size: " + minSize + "x" + minSize);
+        Log.i("Valid preview sizes", "[" + TextUtils.join(", ", bigEnough) + "]");
+        Log.i("Rejected preview sizes", " [" + TextUtils.join(", ", tooSmall) + "]");
+
+        if (exactSizeFound) {
+            Log.i("ExactSize", "Exact size match found.");
+            return desiredSize;
+        }
+
+        // 选一个最小的，假设我们找到了
+        if (bigEnough.size() > 0) {
+            final android.util.Size chosenSize = Collections.min(bigEnough, new CompareSizesByArea());
+            Log.i("Chosen size ", chosenSize.getWidth() + "x" + chosenSize.getHeight());
+            return chosenSize;
+        } else {
+            Log.e("BigEnoughSize", "Couldn't find any suitable preview size");
+            return choices[0];
+        }
+    }
+
+    public static CameraConnectionFragment newInstance(
+            final ConnectionCallback callback,
+            final ImageReader.OnImageAvailableListener imageListener,
+            final int layout,
+            final android.util.Size inputSize) {
+        return new CameraConnectionFragment(callback, imageListener, layout, inputSize);
+    }
+
+    /**
+     * Shows a {@link Toast} on the UI thread.
+     *
+     * @param text The message to show
+     */
+    private void showToast(final String text) {
+        final Activity activity = getActivity();
+        if (activity != null) {
+            activity.runOnUiThread(
+                    new Runnable() {
+                        @Override
+                        public void run() {
+                            Toast.makeText(activity, text, Toast.LENGTH_SHORT).show();
+                        }
+                    });
+        }
+    }
+
+    @Override
+    public View onCreateView(
+            final LayoutInflater inflater, final ViewGroup container, final Bundle savedInstanceState) {
+        return inflater.inflate(layout, container, false);
+    }
+
+    @Override
+    public void onViewCreated(final View view, final Bundle savedInstanceState) {
+        textureView = (AutoFitTextureView) view.findViewById(R.id.texture);
+    }
+
+    @Override
+    public void onActivityCreated(final Bundle savedInstanceState) {
+        super.onActivityCreated(savedInstanceState);
+    }
+
+    @Override
+    public void onResume() {
+        super.onResume();
+        startBackgroundThread();
+
+        // 当屏幕被关闭和打开时，SurfaceTexture已经是并且"onSurfaceTextureAvailable"不会被调用。那样的话，我们就可以开门了
+        // 一个相机，并开始预览从这里(否则，我们等待，直到表面准备好SurfaceTextureListener)。
+        if (textureView.isAvailable()) {
+            openCamera(textureView.getWidth(), textureView.getHeight());
+        } else {
+            textureView.setSurfaceTextureListener(surfaceTextureListener);
+        }
+    }
+
+    @Override
+    public void onPause() {
+        closeCamera();
+        stopBackgroundThread();
+        super.onPause();
+    }
+
+    public void setCamera(String cameraId) {
+        this.cameraId = cameraId;
+    }
+
+    /**
+     * Sets up member variables related to camera.
+     */
+    private void setUpCameraOutputs() {
+        final Activity activity = getActivity();
+        final CameraManager manager = (CameraManager) activity.getSystemService(Context.CAMERA_SERVICE);
+        try {
+            final CameraCharacteristics characteristics = manager.getCameraCharacteristics(cameraId);
+
+            final StreamConfigurationMap map =
+                    characteristics.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP);
+
+            sensorOrientation = characteristics.get(CameraCharacteristics.SENSOR_ORIENTATION);
+
+            // Danger, W.R.! 尝试使用太大的预览尺寸可能会超过相机 总线的带宽限制，导致华丽的预览却无法存储
+            // 垃圾捕获数据。
+            previewSize =
+                    chooseOptimalSize(
+                            map.getOutputSizes(SurfaceTexture.class),
+                            inputSize.getWidth(),
+                            inputSize.getHeight());
+
+            // 我们将TextureView的纵横比与我们选择的预览大小相匹配。
+            final int orientation = getResources().getConfiguration().orientation;
+            if (orientation == Configuration.ORIENTATION_LANDSCAPE) {
+                textureView.setAspectRatio(previewSize.getWidth(), previewSize.getHeight());
+            } else {
+                textureView.setAspectRatio(previewSize.getHeight(), previewSize.getWidth());
+            }
+        } catch (final CameraAccessException e) {
+            e.printStackTrace();
+        } catch (final NullPointerException e) {
+            // 当前使用Camera2API但不支持时抛出NPE设备运行此代码。
+            // TODO(andrewharp):抽象的ErrorDialog/RuntimeException处理到新的方法和在整个应用程序中重用。
+            ErrorDialog.newInstance(getString(R.string.camera_error))
+                    .show(getChildFragmentManager(), FRAGMENT_DIALOG);
+            throw new RuntimeException(getString(R.string.camera_error));
+        }
+
+        cameraConnectionCallback.onPreviewSizeChosen(previewSize, sensorOrientation);
+    }
+
+    /**
+     * 打开由{@link CameraConnectionFragment#cameraId}指定的相机。
+     */
+    private void openCamera(final int width, final int height) {
+        setUpCameraOutputs();
+        configureTransform(width, height);
+        final Activity activity = getActivity();
+        final CameraManager manager = (CameraManager) activity.getSystemService(Context.CAMERA_SERVICE);
+        try {
+            if (!cameraOpenCloseLock.tryAcquire(2500, TimeUnit.MILLISECONDS)) {
+                throw new RuntimeException("Time out waiting to lock camera opening.");
+            }
+            if (checkSelfPermission(getActivity(), Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
+                // TODO:考虑调用
+                // 活动# requestPermissions
+                // 在这里请求缺少的权限，然后重写public void onRequestPermissionsResult(int requestCode, String[] permissions，
+                // int[] grantResults
+                ////处理用户授予权限的情况。参见文档
+                ////获取活动#requestPermissions的详细信息。
+                return;
+            }
+            manager.openCamera(cameraId, stateCallback, backgroundHandler);
+        } catch (final CameraAccessException e) {
+            e.printStackTrace();
+        } catch (final InterruptedException e) {
+            throw new RuntimeException("Interrupted while trying to lock camera opening.", e);
+        }
+    }
+
+    /**
+     * 关闭当前{@link CameraDevice}。
+     */
+    private void closeCamera() {
+        try {
+            cameraOpenCloseLock.acquire();
+            if (null != captureSession) {
+                captureSession.close();
+                captureSession = null;
+            }
+            if (null != cameraDevice) {
+                cameraDevice.close();
+                cameraDevice = null;
+            }
+            if (null != previewReader) {
+                previewReader.close();
+                previewReader = null;
+            }
+        } catch (final InterruptedException e) {
+            throw new RuntimeException("Interrupted while trying to lock camera closing.", e);
+        } finally {
+            cameraOpenCloseLock.release();
+        }
+    }
+
+    /**
+     * 启动一个后台线程和它的{@link Handler}.
+     */
+    private void startBackgroundThread() {
+        backgroundThread = new HandlerThread("ImageListener");
+        backgroundThread.start();
+        backgroundHandler = new Handler(backgroundThread.getLooper());
+    }
+
+    /**
+     * 停止后台线程和它的{@link Handler}.
+     */
+    private void stopBackgroundThread() {
+        backgroundThread.quitSafely();
+        try {
+            backgroundThread.join();
+            backgroundThread = null;
+            backgroundHandler = null;
+        } catch (final InterruptedException e) {
+            e.printStackTrace();
+        }
+    }
+
+    /**
+     * 创建一个新的{@link CameraCaptureSession}用于相机预览。
+     */
+    private void createCameraPreviewSession() {
+        try {
+            final SurfaceTexture texture = textureView.getSurfaceTexture();
+            assert texture != null;
+
+            // 将默认缓冲区的大小设置为我们想要的相机预览大小。
+            texture.setDefaultBufferSize(previewSize.getWidth(), previewSize.getHeight());
+
+            // 这是需要开始预览的输出Surface。
+            final Surface surface = new Surface(texture);
+
+            // 设置了一个CaptureRequest。带有输出Surface的构建器。
+            previewRequestBuilder = cameraDevice.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW);
+            previewRequestBuilder.addTarget(surface);
+
+            Log.i("Opening camera preview", previewSize.getWidth() + "x" + previewSize.getHeight());
+
+            // 为预览框架创建阅读器。
+            previewReader =
+                    ImageReader.newInstance(
+                            previewSize.getWidth(), previewSize.getHeight(), ImageFormat.YUV_420_888, 2);
+
+            previewReader.setOnImageAvailableListener(imageListener, backgroundHandler);
+            previewRequestBuilder.addTarget(previewReader.getSurface());
+
+            // 为相机预览创建了一个CameraCaptureSession
+            cameraDevice.createCaptureSession(
+                    Arrays.asList(surface, previewReader.getSurface()),
+                    new CameraCaptureSession.StateCallback() {
+
+                        @Override
+                        public void onConfigured(final CameraCaptureSession cameraCaptureSession) {
+                            //摄像机已经关闭了
+                            if (null == cameraDevice) {
+                                return;
+                            }
+
+                            // 当会话准备就绪时，我们开始显示预览
+                            captureSession = cameraCaptureSession;
+                            try {
+                                // 自动对焦应该是连续的相机预览。
+                                previewRequestBuilder.set(
+                                        CaptureRequest.CONTROL_AF_MODE,
+                                        CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE);
+                                // Flash在必要时自动启用。
+                                previewRequestBuilder.set(
+                                        CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON_AUTO_FLASH);
+
+                                // 最后，我们开始显示相机预览。
+                                previewRequest = previewRequestBuilder.build();
+                                captureSession.setRepeatingRequest(
+                                        previewRequest, captureCallback, backgroundHandler);
+                            } catch (final CameraAccessException e) {
+                                e.printStackTrace();
+                            }
+                        }
+
+                        @Override
+                        public void onConfigureFailed(final CameraCaptureSession cameraCaptureSession) {
+                            showToast("Failed");
+                        }
+                    },
+                    null);
+        } catch (final CameraAccessException e) {
+            e.printStackTrace();
+        }
+    }
+
+    /**
+     *配置必要的{@链接矩阵}转换为' mTextureView '。这个方法应该是
+     *在setUpCameraOutputs中确定了相机预览大小和的大小后调用
+     修正了' mTextureView '。
+     *
+     * @param viewWidth  mTextureView的宽度
+     * @param viewHeight mTextureView的高度
+     */
+    private void configureTransform(final int viewWidth, final int viewHeight) {
+        final Activity activity = getActivity();
+        if (null == textureView || null == previewSize || null == activity) {
+            return;
+        }
+        final int rotation = activity.getWindowManager().getDefaultDisplay().getRotation();
+        final Matrix matrix = new Matrix();
+        final RectF viewRect = new RectF(0, 0, viewWidth, viewHeight);
+        final RectF bufferRect = new RectF(0, 0, previewSize.getHeight(), previewSize.getWidth());
+        final float centerX = viewRect.centerX();
+        final float centerY = viewRect.centerY();
+        if (Surface.ROTATION_90 == rotation || Surface.ROTATION_270 == rotation) {
+            bufferRect.offset(centerX - bufferRect.centerX(), centerY - bufferRect.centerY());
+            matrix.setRectToRect(viewRect, bufferRect, Matrix.ScaleToFit.FILL);
+            final float scale =
+                    Math.max(
+                            (float) viewHeight / previewSize.getHeight(),
+                            (float) viewWidth / previewSize.getWidth());
+            matrix.postScale(scale, scale, centerX, centerY);
+            matrix.postRotate(90 * (rotation - 2), centerX, centerY);
+        } else if (Surface.ROTATION_180 == rotation) {
+            matrix.postRotate(180, centerX, centerY);
+        }
+        textureView.setTransform(matrix);
+    }
+
+    /**
+     * 当选定的预览大小为时，用于初始化其数据的活动的回调
+     */
+    public interface ConnectionCallback {
+        void onPreviewSizeChosen(android.util.Size size, int cameraRotation);
+    }
+
+    /**
+     *比较两个{@code Size}基于它们的区域
+     */
+    static class CompareSizesByArea implements Comparator<android.util.Size> {
+        @Override
+        public int compare(final android.util.Size lhs, final Size rhs) {
+            // We cast here to ensure the multiplications won't overflow
+            return Long.signum(
+                    (long) lhs.getWidth() * lhs.getHeight() - (long) rhs.getWidth() * rhs.getHeight());
+        }
+    }
+
+    /**
+     * 显示一个错误消息对话框。
+     */
+    public static class ErrorDialog extends DialogFragment {
+        private static final String ARG_MESSAGE = "message";
+
+        public static ErrorDialog newInstance(final String message) {
+            final ErrorDialog dialog = new ErrorDialog();
+            final Bundle args = new Bundle();
+            args.putString(ARG_MESSAGE, message);
+            dialog.setArguments(args);
+            return dialog;
+        }
+
+        @Override
+        public Dialog onCreateDialog(final Bundle savedInstanceState) {
+            final Activity activity = getActivity();
+            return new AlertDialog.Builder(activity)
+                    .setMessage(getArguments().getString(ARG_MESSAGE))
+                    .setPositiveButton(
+                            android.R.string.ok,
+                            new DialogInterface.OnClickListener() {
+                                @Override
+                                public void onClick(final DialogInterface dialogInterface, final int i) {
+                                    activity.finish();
+                                }
+                            })
+                    .create();
+        }
+    }
+}
